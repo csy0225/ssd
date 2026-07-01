@@ -163,5 +163,5 @@ class Attention(nn.Module):
                         o = _fi_attn.paged_attn(q, k_cache, v_cache, context.block_tables,
                                                 context.context_lens, qo_indptr, self.scale)
 
-        o = o.view(-1, self.num_heads * self.head_dim)
+        o = o.reshape(-1, self.num_heads * self.head_dim)
         return o

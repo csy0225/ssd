@@ -1,5 +1,6 @@
 import os
 import time
+import importlib.util
 import torch
 import torch.distributed as dist
 import dataclasses
@@ -21,13 +22,20 @@ class DraftRunner(ModelRunner):
     @classmethod
     def create_draft_config(cls, cfg: Config) -> Config:
         """Create a draft config from the main config without instantiating DraftRunner."""
+        # The ASYNC draft's tree-decode cudagraph capture is flashinfer-specific.
+        # On stacks without flashinfer (e.g. Iluvatar) force only the *async* draft
+        # to eager so the TARGET can still use cudagraph while the draft tree runs
+        # eager (fused ixinfer kernel). The *sync* draft only does single-token
+        # decodes (cudagraph-capturable) so it is left on cudagraph.
+        draft_eager = cfg.enforce_eager or (
+            cfg.draft_async and importlib.util.find_spec("flashinfer") is None)
         draft_cfg = dataclasses.replace(
             cfg,
             model=cfg.draft,
             gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
             tokenizer_path=cfg.model if cfg.use_eagle else None,
             d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
-            enforce_eager=cfg.enforce_eager,
+            enforce_eager=draft_eager,
         )
         return draft_cfg
 
