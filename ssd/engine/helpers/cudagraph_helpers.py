@@ -901,3 +901,116 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         graph_vars["hidden_states"] = fi_hidden_states
 
     return graph_vars, graph_pool, graphs, graph_bs_list
+
+
+# ---------------------------------------------------------------------------
+# Iluvatar (no-flashinfer) async tree-decode cudagraph: static ixinfer path.
+# Mirrors capture_fi_tree_decode_cudagraph but the tree attention is the
+# IxTreeAttn wrapper (only_prefill_wrapper) with a static float mask buffer.
+# ---------------------------------------------------------------------------
+def capture_ix_tree_decode_cudagraph(model_runner):
+    config = model_runner.config
+    hf_config = config.hf_config
+    max_bs = min(config.max_num_seqs, 512)
+    MQ_LEN = sum(config.fan_out_list)
+    max_flat = max_bs * MQ_LEN
+    max_num_blocks = (config.max_model_len + model_runner.block_size - 1) // model_runner.block_size
+    dev = model_runner.device
+
+    input_ids = torch.zeros(max_flat, dtype=torch.int64, device=dev)
+    positions = torch.zeros(max_flat, dtype=torch.int64, device=dev)
+    slot_mapping = torch.zeros(max_flat, dtype=torch.int32, device=dev)
+    context_lens = torch.full((max_bs,), config.max_model_len, dtype=torch.int32, device=dev)
+    block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
+    outputs = torch.empty(max_flat, hf_config.hidden_size, device=dev)
+    logits = torch.empty(max_flat, hf_config.vocab_size, device=dev)
+
+    graph_bs_list = [1]
+    for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
+        if bs <= max_bs:
+            graph_bs_list.append(bs)
+    if max_bs not in graph_bs_list:
+        graph_bs_list.append(max_bs)
+    graph_bs_list.sort()
+
+    graphs = {}
+    graph_pool = None
+    wrapper = model_runner.only_prefill_wrapper  # IxTreeAttn
+
+    for bs in reversed(graph_bs_list):
+        graph = torch.cuda.CUDAGraph()
+        # all-keep mask for warmup/capture (real masks copied in per step)
+        with torch.inference_mode():
+            wrapper.mask_buf[:bs].zero_()
+            set_context(False, slot_mapping=slot_mapping[:bs * MQ_LEN],
+                        context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs * MQ_LEN] = model_runner.model(input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN])
+            logits[:bs * MQ_LEN] = model_runner.model.compute_logits(outputs[:bs * MQ_LEN], False)
+            with torch.cuda.graph(graph, graph_pool):
+                outputs[:bs * MQ_LEN] = model_runner.model(input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN])
+                logits[:bs * MQ_LEN] = model_runner.model.compute_logits(outputs[:bs * MQ_LEN], False)
+        if graph_pool is None:
+            graph_pool = graph.pool()
+        graphs[bs] = graph
+        torch.cuda.synchronize()
+        reset_context()
+
+    graph_vars = dict(
+        input_ids=input_ids, positions=positions, slot_mapping=slot_mapping,
+        block_tables=block_tables, context_lens=context_lens, outputs=outputs, logits=logits,
+    )
+    return graph_vars, graph_pool, graphs, graph_bs_list
+
+
+def run_ix_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits, hidden_states=None):
+    context = get_context()
+    K = model_runner.config.speculate_k
+    F = model_runner.config.async_fan_out
+    MQ_LEN = sum(model_runner.config.fan_out_list)
+    orig_flat = input_ids.size(0)
+    orig_B = orig_flat // MQ_LEN
+    wrapper = model_runner.only_prefill_wrapper  # IxTreeAttn
+
+    wrapper_bs = next(x for x in model_runner.graph_bs_list["ix_tree_decode"] if x >= orig_B)
+    graph = model_runner.graphs["ix_tree_decode"][wrapper_bs]
+
+    slot_mapping = context.slot_mapping
+    block_tables = context.block_tables
+    context_lens = context.context_lens
+    if wrapper_bs > orig_B:
+        pad_B = wrapper_bs - orig_B
+        pad_flat = pad_B * MQ_LEN
+        dev = input_ids.device
+        input_ids = torch.cat([input_ids, torch.zeros(pad_flat, dtype=input_ids.dtype, device=dev)])
+        positions = torch.cat([positions, torch.zeros(pad_flat, dtype=positions.dtype, device=dev)])
+        slot_mapping = torch.cat([slot_mapping, torch.full((pad_flat,), -1, dtype=slot_mapping.dtype, device=dev)])
+        block_tables = torch.cat([block_tables, block_tables[orig_B - 1:orig_B].expand(pad_B, -1).contiguous()])
+        context_lens = torch.cat([context_lens, context_lens[orig_B - 1:orig_B].expand(pad_B).contiguous()])
+        cache_hits = torch.cat([cache_hits, torch.zeros(pad_B, device=cache_hits.device)])
+    B = wrapper_bs
+
+    # Build the per-step float additive tree mask into the wrapper's static buffer.
+    mask_flat = get_custom_mask(model_runner.config, context_lens, step, K, F, B,
+                                device=model_runner.device, cache_hits=cache_hits)
+    NEG = float("-inf")
+    zero_s = torch.zeros((), dtype=torch.float32, device=model_runner.device)
+    neg_s = torch.full((), NEG, dtype=torch.float32, device=model_runner.device)
+    cl_list = context_lens.tolist()
+    off = 0
+    for b in range(B):
+        ctx_b = int(cl_list[b])   # context_lens is already the grown context for this step
+        n = MQ_LEN * ctx_b
+        m_b = mask_flat[off:off + n].view(MQ_LEN, ctx_b)
+        off += n
+        wrapper.mask_buf[b, :, :ctx_b] = torch.where(m_b.bool(), zero_s, neg_s)
+        wrapper.mask_buf[b, :, ctx_b:] = NEG
+
+    graph_vars["input_ids"][:B * MQ_LEN] = input_ids
+    graph_vars["positions"][:B * MQ_LEN] = positions
+    graph_vars["slot_mapping"][:B * MQ_LEN] = slot_mapping
+    graph_vars["context_lens"][:B] = context_lens
+    if step == 0:
+        graph_vars["block_tables"][:B, :block_tables.size(1)] = block_tables
+
+    graph.replay()
+    return graph_vars["logits"][:orig_flat]

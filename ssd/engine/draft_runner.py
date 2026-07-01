@@ -22,13 +22,10 @@ class DraftRunner(ModelRunner):
     @classmethod
     def create_draft_config(cls, cfg: Config) -> Config:
         """Create a draft config from the main config without instantiating DraftRunner."""
-        # The ASYNC draft's tree-decode cudagraph capture is flashinfer-specific.
-        # On stacks without flashinfer (e.g. Iluvatar) force only the *async* draft
-        # to eager so the TARGET can still use cudagraph while the draft tree runs
-        # eager (fused ixinfer kernel). The *sync* draft only does single-token
-        # decodes (cudagraph-capturable) so it is left on cudagraph.
-        draft_eager = cfg.enforce_eager or (
-            cfg.draft_async and importlib.util.find_spec("flashinfer") is None)
+        # Draft follows the global enforce_eager. On Iluvatar (no flashinfer) the
+        # async draft tree-decode is captured via the static ixinfer path
+        # (capture_ix_tree_decode_cudagraph), so the draft can run cudagraph too.
+        draft_eager = cfg.enforce_eager
         draft_cfg = dataclasses.replace(
             cfg,
             model=cfg.draft,

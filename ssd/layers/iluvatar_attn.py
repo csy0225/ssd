@@ -159,6 +159,49 @@ def paged_verify(q, k_cache, v_cache, block_tables, context_lens, q_len, scale):
     return o.permute(0, 2, 1, 3).reshape(total, nq, hd)
 
 
+class IxTreeAttn:
+    """CUDA-graph-capturable async tree-decode attention (Iluvatar).
+
+    Holds a STATIC float additive mask buffer [max_bs, MQ_LEN, max_ctx]. The
+    per-step tree mask is copied into it (outside the graph) by
+    run_ix_tree_decode; `.run` (captured) gathers all max_blocks of KV from the
+    paged cache using the static block_tables and applies the static mask via
+    the fused ixinfer kernel. Fully static-shape -> capturable.
+    """
+
+    def __init__(self, max_bs, mq_len, max_num_blocks, block_size, device):
+        self.mq_len = int(mq_len)
+        self.block_size = int(block_size)
+        self.max_ctx = int(max_num_blocks) * int(block_size)
+        self.mask_buf = torch.zeros(max_bs, self.mq_len, self.max_ctx,
+                                    dtype=torch.float32, device=device)
+        self._planned = True
+
+    # accept the flashinfer-style plan() call as a no-op (buffers are static)
+    def plan(self, *a, **k):
+        pass
+
+    def run(self, q, kv):
+        from ssd.utils.context import get_context
+        ctx = get_context()
+        k_cache, v_cache = kv
+        N, nq, hd = q.shape
+        mq = self.mq_len
+        bs = N // mq
+        block_size = k_cache.shape[1]
+        n_kv = k_cache.shape[2]
+        max_ctx = self.max_ctx
+        scale = hd ** -0.5
+
+        bt = ctx.block_tables[:bs].clamp_min(0).to(torch.long)     # [bs, max_blocks]
+        kg = k_cache[bt].reshape(bs, max_ctx, n_kv, hd).permute(0, 2, 1, 3)   # [bs, n_kv, ctx, hd]
+        vg = v_cache[bt].reshape(bs, max_ctx, n_kv, hd).permute(0, 2, 1, 3)
+        qh = q.reshape(bs, mq, nq, hd).permute(0, 2, 1, 3)         # [bs, nq, mq, hd]
+        mask = self.mask_buf[:bs].unsqueeze(1)                     # [bs, 1, mq, ctx]
+        o = _masked_attn(qh, kg, vg, mask, scale)                 # [bs, nq, mq, hd]
+        return o.permute(0, 2, 1, 3).reshape(N, nq, hd)
+
+
 class EagerTreeAttn:
     """Async tree-decode attention (replaces flashinfer paged wrapper). Runs
     the packed tree mask through the fused ixinfer kernel (SDPA fallback)."""
