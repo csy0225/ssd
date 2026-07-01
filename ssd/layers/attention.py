@@ -8,7 +8,11 @@ try:
     _HAS_SGL_FA = True
 except ImportError:
     _HAS_SGL_FA = False
-    from ssd.layers import flashinfer_attn as _fi_attn
+    try:
+        from ssd.layers import flashinfer_attn as _fi_attn
+    except ImportError:
+        # No flashinfer either (e.g. Iluvatar BI-V150) -> FA2 + torch-SDPA backend.
+        from ssd.layers import iluvatar_attn as _fi_attn
 from ssd.utils.context import get_context
 
 
@@ -119,8 +123,14 @@ class Attention(nn.Module):
                                             cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
                                             )
                 else:
-                    o = _fi_attn.paged_attn(q, k_cache, v_cache, context.block_tables,
-                                            context.context_lens, context.cu_seqlens_q, self.scale)
+                    if (hasattr(_fi_attn, "paged_verify") and not self.use_eagle
+                            and q.shape[0] % (self.K + 1) == 0):
+                        # Iluvatar: static-shape, cudagraph-capturable verify (uniform K+1)
+                        o = _fi_attn.paged_verify(q, k_cache, v_cache, context.block_tables,
+                                                  context.context_lens, self.K + 1, self.scale)
+                    else:
+                        o = _fi_attn.paged_attn(q, k_cache, v_cache, context.block_tables,
+                                                context.context_lens, context.cu_seqlens_q, self.scale)
 
             elif tree_decode:
                 if self.only_prefill_wrapper is not None:
@@ -143,10 +153,15 @@ class Attention(nn.Module):
                                                 softmax_scale=self.scale, causal=True,
                                                 )
                 else:
-                    bs = q.shape[0]
-                    qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device=q.device)
-                    o = _fi_attn.paged_attn(q, k_cache, v_cache, context.block_tables,
-                                            context.context_lens, qo_indptr, self.scale)
+                    if hasattr(_fi_attn, "paged_decode"):
+                        # Iluvatar: static-shape, cudagraph-capturable single-query decode
+                        o = _fi_attn.paged_decode(q, k_cache, v_cache, context.block_tables,
+                                                  context.context_lens, self.scale)
+                    else:
+                        bs = q.shape[0]
+                        qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device=q.device)
+                        o = _fi_attn.paged_attn(q, k_cache, v_cache, context.block_tables,
+                                                context.context_lens, qo_indptr, self.scale)
 
         o = o.view(-1, self.num_heads * self.head_dim)
         return o

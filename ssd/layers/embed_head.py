@@ -75,6 +75,22 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.tp_group = tp_group
         self.tp_size = tp_size
 
+    def _gather_logits(self, flat_logits):
+        """Reconstruct full-vocab logits from per-rank shards.
+
+        Default: gather to tp_rank 0 only (target TP — followers don't sample).
+        When `gather_all` is set (async draft TP), every rank all-gathers so the
+        SPMD draft loop computes identical tokens on every draft rank."""
+        if self.tp_size <= 1:
+            return flat_logits
+        if getattr(self, "gather_all", False):
+            parts = [torch.empty_like(flat_logits) for _ in range(self.tp_size)]
+            dist.all_gather(parts, flat_logits, group=self.tp_group)
+            return torch.cat(parts, dim=-1)
+        parts = [torch.empty_like(flat_logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+        dist.gather(flat_logits, parts, 0, group=self.tp_group)
+        return torch.cat(parts, dim=-1) if self.tp_rank == 0 else None
+
     def forward(self, x: torch.Tensor, last_only: bool = True): # x is always [nt = B*S, D] -> [nt, V]
         context = get_context()
         if context.cu_seqlens_q is not None:  # mq decode (prefill, glue, verify, tree decode)
@@ -87,16 +103,12 @@ class ParallelLMHead(VocabParallelEmbedding):
                     # Return logits for all tokens in prefill
                     flat_logits = F.linear(x, self.weight)
                     if self.tp_size > 1:
-                        parts = [torch.empty_like(flat_logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-                        dist.gather(flat_logits, parts, 0, group=self.tp_group)
-                        flat_logits = torch.cat(parts, dim=-1) if self.tp_rank == 0 else None
+                        flat_logits = self._gather_logits(flat_logits)
                     return flat_logits
             else: # multi-query decode path (glue, verify, tree)
                 flat_logits = F.linear(x, self.weight)
                 if self.tp_size > 1:
-                    parts = [torch.empty_like(flat_logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-                    dist.gather(flat_logits, parts, 0, group=self.tp_group)
-                    flat_logits = torch.cat(parts, dim=-1) if self.tp_rank == 0 else None
+                    flat_logits = self._gather_logits(flat_logits)
                 if flat_logits is None:
                     return None
                 # Check if constant query len (verify/tree) or variable (glue)
@@ -107,11 +119,9 @@ class ParallelLMHead(VocabParallelEmbedding):
                     return flat_logits.view(batch_size, constant_query_len, flat_logits.size(-1))
                 return flat_logits  # variable-length: return flat [N, V]
 
-        # decode, get single token 
+        # decode, get single token
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0, group=self.tp_group)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            logits = self._gather_logits(logits)
         return logits
 

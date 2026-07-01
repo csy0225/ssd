@@ -1,18 +1,27 @@
 import os
 import torch
 from torch import nn
-import flashinfer
+try:
+    import flashinfer
+    import flashinfer.sampling as _fi_samp
+    _HAS_FLASHINFER = True
+except ImportError:
+    # Iluvatar BI-V150 etc.: no flashinfer. Greedy (temp=0) path uses torch
+    # argmax and never touches flashinfer sampling.
+    flashinfer = None
+    _fi_samp = None
+    _HAS_FLASHINFER = False
 
 from ssd.utils.async_helpers.async_spec_helpers import apply_sampler_x_rescaling
 
 # NOTE: the original 0.5.2 monkey-patch is disabled here. On flashinfer 0.6.12
 # get_seed_and_offset has a different (3-arg) signature and works correctly, so
 # we delegate straight through instead of replacing it.
-import flashinfer.sampling as _fi_samp
-_orig_get_seed_and_offset = _fi_samp.get_seed_and_offset
-def _fixed_get_seed_and_offset(*args, **kwargs):
-    return _orig_get_seed_and_offset(*args, **kwargs)
-_fi_samp.get_seed_and_offset = _fixed_get_seed_and_offset
+if _HAS_FLASHINFER:
+    _orig_get_seed_and_offset = _fi_samp.get_seed_and_offset
+    def _fixed_get_seed_and_offset(*args, **kwargs):
+        return _orig_get_seed_and_offset(*args, **kwargs)
+    _fi_samp.get_seed_and_offset = _fixed_get_seed_and_offset
 
 torch.manual_seed(0) 
 

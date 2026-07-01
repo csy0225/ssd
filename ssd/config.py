@@ -28,6 +28,8 @@ class Config:
     
     # async spec only
     async_fan_out: int = 3
+    # number of GPUs the async draft runs on (TP group). target gets num_gpus - draft_num_gpus.
+    draft_num_gpus: int = 1
     fan_out_list: list[int] | None = None
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
@@ -52,7 +54,10 @@ class Config:
         model = self.model 
         assert os.path.isdir(model)
 
-        assert 1 <= self.num_gpus <= 8 # this codebase only works on one node
+        assert 1 <= self.num_gpus <= 16 # single node; Iluvatar BI-V150 box has 16 GPUs
+        if self.draft_async:
+            assert self.num_gpus > self.draft_num_gpus, (
+                "async draft needs num_gpus > draft_num_gpus (target gets the rest)")
         self.hf_config = self._load_hf_config(model)
         self.max_model_len = min(
             self.max_model_len, self.hf_config.max_position_embeddings)

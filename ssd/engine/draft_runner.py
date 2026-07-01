@@ -48,13 +48,38 @@ class DraftRunner(ModelRunner):
             print(f'DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
 
+    def _leader_recv(self, shape, dtype):
+        """Draft leader recvs a tensor from target rank 0; broadcast to draft TP group."""
+        t = torch.empty(shape, dtype=dtype, device=self.device)
+        if self.is_draft_leader:
+            dist.recv(t, src=0, group=self.async_pg)
+        self._draft_bcast(t)
+        return t
+
+    def _leader_recv_into(self, tensor):
+        if self.is_draft_leader:
+            dist.recv(tensor, src=0, group=self.async_pg)
+        self._draft_bcast(tensor)
+        return tensor
+
+    def _leader_recv_int64(self, total_length):
+        if self.is_draft_leader:
+            t = recv_int64(self.async_pg, src=0, total_length=total_length, device=self.device)
+        else:
+            t = torch.empty(total_length, dtype=torch.int64, device=self.device)
+        self._draft_bcast(t)
+        return t
+
+    def _leader_send(self, tensor, dst=0):
+        """Only the draft leader sends results back to target rank 0."""
+        if self.is_draft_leader:
+            dist.send(tensor, dst=dst, group=self.async_pg)
+
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
 
-        # 1) Receive metadata then individual tensors
-        # First recv metadata to learn sizes
-        metadata = torch.zeros(5, dtype=torch.int64, device=self.device)
-        dist.recv(metadata, src=0, group=self.async_pg)
+        # 1) Receive metadata then individual tensors (leader recvs, broadcasts to draft TP group)
+        metadata = self._leader_recv((5,), torch.int64)
         total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = metadata.tolist()
         if use_eagle:
             assert eagle_act_dim == 3 * self.config.d_model_target, (
@@ -63,7 +88,7 @@ class DraftRunner(ModelRunner):
 
         # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
         fused_total = total_new_tokens + batch_size + batch_size * max_blocks
-        fused = recv_int64(self.async_pg, src=0, total_length=fused_total, device=self.device)
+        fused = self._leader_recv_int64(fused_total)
         off = 0
         input_ids = fused[off:off + total_new_tokens]; off += total_new_tokens
         num_tokens = fused[off:off + batch_size]; off += batch_size
@@ -75,7 +100,7 @@ class DraftRunner(ModelRunner):
             eagle_acts = torch.zeros(
                 total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
             )
-            dist.recv(eagle_acts, src=0, group=self.async_pg)
+            self._leader_recv_into(eagle_acts)
 
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
 
@@ -293,8 +318,7 @@ class DraftRunner(ModelRunner):
         # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
         max_blocks = self.config.max_blocks
         fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
-        fused_req = recv_int64(self.async_pg, src=0,
-                               total_length=fused_total, device=self.device)
+        fused_req = self._leader_recv_int64(fused_total)
         off = 0
         cache_keys = fused_req[off:off + (3 * B)].view(B, 3)
         off += 3 * B
@@ -318,16 +342,16 @@ class DraftRunner(ModelRunner):
         extend_token_ids = None
 
         if self.config.use_eagle:
-            dist.recv(target_recovery_activations, src=0, group=self.async_pg)
+            self._leader_recv_into(target_recovery_activations)
 
             # Receive extend data for fused glue decode
             act_dim = 3 * self.config.d_model_target
             extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
             extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
             extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
-            dist.recv(extend_counts, src=0, group=self.async_pg)
-            dist.recv(extend_eagle_acts, src=0, group=self.async_pg)
-            dist.recv(extend_token_ids, src=0, group=self.async_pg)
+            self._leader_recv_into(extend_counts)
+            self._leader_recv_into(extend_eagle_acts)
+            self._leader_recv_into(extend_token_ids)
 
             if self.config.verbose:
                 recovery_tokens_target = cache_keys[:, 2].clone()
@@ -358,8 +382,8 @@ class DraftRunner(ModelRunner):
             print(f"", flush=True)
 
         fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
-        dist.send(fused_response, dst=0, group=self.async_pg)
-        dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
+        self._leader_send(fused_response)
+        self._leader_send(out_logits[:, :K, :].contiguous())
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,

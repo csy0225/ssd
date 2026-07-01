@@ -7,7 +7,14 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer, AutoConfig
 import os
-import flashinfer
+try:
+    import flashinfer
+    _HAS_FLASHINFER = True
+except ImportError:
+    # Iluvatar BI-V150 etc.: no flashinfer. Async tree-decode uses the
+    # EagerTreeAttn (FA2 + torch-SDPA) wrapper instead; see iluvatar_attn.py.
+    flashinfer = None
+    _HAS_FLASHINFER = False
 from ssd.config import Config
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
@@ -68,51 +75,70 @@ class ModelRunner:
         self.rank = rank
         self.use_eagle = config.use_eagle
 
+        # --- Tensor-parallel topology ---
+        # Target uses ranks [0, n_tp_target). The async draft uses ranks
+        # [n_tp_target, num_gpus) as its own TP group; the first draft rank is
+        # the "draft leader" and is the only one that exchanges with target rank 0.
         if config.draft_async:
-            self.draft_rank = config.num_gpus - 1
-            if self.is_draft:
-                # [N, 3] int64, {(seq_id, len(new_suffix), rec_token): (speculated_tokens, logits_q)}
-                self.prev_fork_keys: torch.Tensor | None = None
-                self.prev_fork_block_tables: torch.Tensor | None = None  # [N, M] int32 with -1 padding
+            n_tp_target = config.num_gpus - config.draft_num_gpus
+        elif should_use_dist:
+            n_tp_target = config.num_gpus
+        else:
+            n_tp_target = 1
+        self.n_tp_target = n_tp_target
+        self.draft_leader_rank = n_tp_target
 
-        self.num_tp_gpus = num_tp_gpus # will be in [1 if no dist, num_gpus if not async, num_gpus-1 if async]
-        
-        if self.world_size == 1: # sync speculation or genuine single gpu 
+        if self.is_draft:
+            self.num_tp_gpus = config.draft_num_gpus
+            self.is_draft_leader = (rank == n_tp_target)
+            self.draft_local_rank = rank - n_tp_target
+            # [N, 3] int64, {(seq_id, len(new_suffix), rec_token): (speculated_tokens, logits_q)}
+            self.prev_fork_keys: torch.Tensor | None = None
+            self.prev_fork_block_tables: torch.Tensor | None = None  # [N, M] int32 with -1 padding
+        else:
+            self.num_tp_gpus = n_tp_target
+            self.is_draft_leader = False
+        if config.draft_async:
+            self.draft_rank = n_tp_target  # draft leader talks to target rank 0
+
+        if self.world_size == 1: # sync speculation or genuine single gpu
             assert (config.speculate and not config.draft_async) or self.num_tp_gpus == 1, "ERROR in ModelRunner: draft and async must be False or num_tp_gpus=1"
 
         self.verbose = config.verbose
         self.draft_async = config.draft_async
         self.event = event
-        self._exiting = False 
-        
+        self._exiting = False
+
         torch.cuda.set_device(self.rank)
-        self.device = torch.device(f'cuda:{self.rank}') 
-        
-        # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
+        self.device = torch.device(f'cuda:{self.rank}')
+
+        # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for
         if is_draft and config.draft_async:
             self._init_flashinfer_wrappers()
-        
-        if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
-        self.tp_pg = None 
 
-        if should_use_dist: 
-            default_port = 1223 
+        if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
+        self.tp_pg = None
+
+        if should_use_dist:
+            default_port = 1223
             dist.init_process_group(
                 "nccl", f"tcp://localhost:{default_port}",
                 world_size=self.world_size,
                 rank=self.rank,
                 device_id=self.device,
             )
-
-            self.tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus))) # everyone should see the new_group init even if not in group 
+            # new_group is collective: every rank must create the same groups in
+            # the same order. Target TP group = [0, n_tp_target); draft TP group =
+            # [n_tp_target, num_gpus).
+            tgt_tp_pg = dist.new_group(ranks=list(range(n_tp_target)))
+            draft_tp_pg = None
+            if config.draft_async:
+                draft_tp_pg = dist.new_group(ranks=list(range(n_tp_target, config.num_gpus)))
+            self.tp_pg = draft_tp_pg if self.is_draft else tgt_tp_pg
 
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        
-        if self.is_draft:
-            assert num_tp_gpus == 1, "ERROR in ModelRunner: draft should have tp_size=1"
-            self.tp_pg = None # every rank is given an object from self.tp_pg, even tho draft doesnt participate it gets GROUP_NON_MEMBER object != None back, so we can't assert None here, we 
         
         print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}', flush=True)
         model_type = self.setup_and_warmup_model_and_cudagraphs(config, self.hf_config, init_q, is_draft)
@@ -161,9 +187,19 @@ class ModelRunner:
         self.workspace_buffer = torch.zeros(
             512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}") 
         
-        if self.config.enforce_eager: 
-            self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-        else: 
+        if self.config.enforce_eager:
+            if _HAS_FLASHINFER:
+                self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
+            else:
+                from ssd.layers.iluvatar_attn import EagerTreeAttn
+                self.only_prefill_wrapper = EagerTreeAttn()
+        else:
+            if not _HAS_FLASHINFER:
+                raise RuntimeError(
+                    "cudagraph async tree-decode requires flashinfer, which is "
+                    "absent on this stack (e.g. Iluvatar BI-V150). Run async SSD "
+                    "with --eager."
+                )
             max_bs = min(self.config.max_num_seqs, 512)
             max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
             
@@ -246,6 +282,10 @@ class ModelRunner:
             
         self.model = model_class(**kwargs)
 
+        # Draft TP>1 runs SPMD: every draft rank must see identical full-vocab
+        # logits so tree-decode/jit produce the same tokens on all ranks.
+        if self.is_draft and self.num_tp_gpus > 1 and hasattr(self.model, "lm_head"):
+            self.model.lm_head.gather_all = True
         model_type = "DRAFT " if self.is_draft else "TARGET "
         if self.verbose:
             print(f'-----LOADING {model_type}MODEL----', flush=True)
@@ -379,14 +419,25 @@ class ModelRunner:
             if method_name == "exit":
                 break
 
+    def _draft_bcast(self, tensor):
+        """Broadcast a tensor from the draft leader to the draft TP group.
+        No-op when draft_num_gpus == 1 (single-rank draft group)."""
+        if self.is_draft and self.num_tp_gpus > 1:
+            dist.broadcast(tensor, src=self.draft_leader_rank, group=self.tp_pg)
+        return tensor
+
     def recv_cmd(self):
         t = torch.empty(1, dtype=torch.int64, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
+        if (not self.is_draft) or self.is_draft_leader:
+            dist.recv(t, src=0, group=self.async_pg)
+        self._draft_bcast(t)
         return int(t.item())
 
     def recv_tensor(self, shape, dtype=torch.int64):
         t = torch.empty(shape, dtype=dtype, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
+        if (not self.is_draft) or self.is_draft_leader:
+            dist.recv(t, src=0, group=self.async_pg)
+        self._draft_bcast(t)
         return t
     
     def send_draft_exit_signal(self):
@@ -582,8 +633,8 @@ class ModelRunner:
             kv_indptr,
             kv_indices,
             kv_last_page_len,
-            self.hf_config.num_attention_heads,
-            self.hf_config.num_key_value_heads,
+            self.hf_config.num_attention_heads // self.num_tp_gpus,
+            self.hf_config.num_key_value_heads // self.num_tp_gpus,
             self.hf_config.head_dim,
             self.block_size,
             custom_mask=custom_mask,

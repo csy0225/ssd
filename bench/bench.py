@@ -34,6 +34,7 @@ def parse_arguments():
     parser.add_argument("--k", type=int, default=6, help="Speculative decoding k value")
     parser.add_argument("--async", action="store_true", help="Enable async speculative decoding")
     parser.add_argument("--f", type=int, default=3, help="Async fan out value")
+    parser.add_argument("--draft_tp", type=int, default=1, help="Number of GPUs for the async draft TP group (target gets --gpus minus this)")
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
@@ -166,6 +167,7 @@ def create_llm_kwargs(args, draft_path):
         speculate_k=args.k,
         draft_async=getattr(args, 'async', False),
         async_fan_out=args.f,
+        draft_num_gpus=args.draft_tp,
         verbose=args.verbose,
         draft=draft_path,
         kvcache_block_size=args.block_sz,

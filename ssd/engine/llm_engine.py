@@ -59,10 +59,10 @@ class LLMEngine:
         self.events = []
 
         ctx = mp.get_context("spawn")
-        self.num_tp_gpus = config.num_gpus if not self.config.draft_async else config.num_gpus - 1
+        self.num_tp_gpus = config.num_gpus if not self.config.draft_async else config.num_gpus - config.draft_num_gpus
 
         if config.speculate and config.draft_async:
-            self.draft_ps = None
+            self.draft_ps = []
 
         for i in range(1, self.num_tp_gpus):
             if self.config.verbose:
@@ -81,12 +81,17 @@ class LLMEngine:
 
         if config.speculate and config.draft_async:
             init_q = ctx.Queue()
-            draft_rank = config.num_gpus - 1
-            self.draft_ps = ctx.Process(
-                target=DraftRunner, args=(config, draft_rank, init_q))
-            self.draft_ps.start()
+            n_tp_target = config.num_gpus - config.draft_num_gpus
+            self.draft_ps = []
+            # Spawn draft_num_gpus draft processes forming the draft TP group at
+            # ranks [n_tp_target, num_gpus). The first (leader) reports num_blocks.
+            for dr in range(n_tp_target, config.num_gpus):
+                dq = init_q if dr == n_tp_target else None
+                p = ctx.Process(target=DraftRunner, args=(config, dr, dq))
+                p.start()
+                self.draft_ps.append(p)
             print(
-                f'Draft runner created on rank {draft_rank} (async)!', flush=True)
+                f'Draft runner(s) created on ranks {list(range(n_tp_target, config.num_gpus))} (async, draft_tp={config.draft_num_gpus})!', flush=True)
 
         # modelRunner(0) will wait on all 5 processes, so other 4 need to have launched by now
         self.model_runner = ModelRunner(
@@ -151,13 +156,14 @@ class LLMEngine:
                         p.join(timeout=2)
         except Exception:
             pass
-        # 4) Draft process: after sending cmd=2, give it a moment, then terminate if needed
+        # 4) Draft process(es): after sending cmd=2, give a moment, then terminate if needed
         try:
-            if self.config.speculate and self.config.draft_async and self.draft_ps is not None:
-                self.draft_ps.join(timeout=3)
-                if self.draft_ps.is_alive():
-                    self.draft_ps.terminate()
-                    self.draft_ps.join(timeout=2)
+            if self.config.speculate and self.config.draft_async and self.draft_ps:
+                for p in self.draft_ps:
+                    p.join(timeout=3)
+                    if p.is_alive():
+                        p.terminate()
+                        p.join(timeout=2)
         except Exception:
             pass
         # 5) Kill resource tracker so it doesn't print spurious warnings,
