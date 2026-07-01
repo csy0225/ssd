@@ -3,7 +3,12 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+try:
+    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    _HAS_SGL_FA = True
+except ImportError:
+    _HAS_SGL_FA = False
+    from ssd.layers import flashinfer_attn as _fi_attn
 from ssd.utils.context import get_context
 
 
@@ -87,10 +92,13 @@ class Attention(nn.Module):
                 k, v = k_cache, v_cache
 
             k, v = k.view(-1, self.num_kv_heads, self.head_dim), v.view(-1, self.num_kv_heads, self.head_dim)
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True)
+            if _HAS_SGL_FA:
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True)
+            else:
+                o = _fi_attn.prefill_ragged(q, k, v, context.cu_seqlens_q, context.cu_seqlens_k, self.scale)
         else:
             # verify/glue decode: multi-query with cu_seqlens_q (K+1 or variable per seq)
             verify_or_glue = (
@@ -104,11 +112,15 @@ class Attention(nn.Module):
 
             if verify_or_glue:
                 assert context.context_lens is not None
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, page_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True,
-                                        cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
-                                        )
+                if _HAS_SGL_FA:
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, page_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True,
+                                            cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
+                                            )
+                else:
+                    o = _fi_attn.paged_attn(q, k_cache, v_cache, context.block_tables,
+                                            context.context_lens, context.cu_seqlens_q, self.scale)
 
             elif tree_decode:
                 if self.only_prefill_wrapper is not None:
@@ -124,11 +136,17 @@ class Attention(nn.Module):
                     prefill_wrapper = self.prefill_wrappers[wrapper_bs]
                 o = prefill_wrapper.run(q, (self.k_cache, self.v_cache))
             else: # single query decode
-                q = q.unsqueeze(1)
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, page_table=context.block_tables,
-                                            softmax_scale=self.scale, causal=True,
-                                            )
+                if _HAS_SGL_FA:
+                    q = q.unsqueeze(1)
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                                cache_seqlens=context.context_lens, page_table=context.block_tables,
+                                                softmax_scale=self.scale, causal=True,
+                                                )
+                else:
+                    bs = q.shape[0]
+                    qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device=q.device)
+                    o = _fi_attn.paged_attn(q, k_cache, v_cache, context.block_tables,
+                                            context.context_lens, qo_indptr, self.scale)
 
         o = o.view(-1, self.num_heads * self.head_dim)
         return o

@@ -6,9 +6,11 @@ from random import randint
 from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
 try:
-    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
-except ImportError:
+    # Prefer the benchmark-only path module so vLLM/SGLang clients do not
+    # import the native SSD engine (and therefore do not require sgl-kernel).
     from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
+except ImportError:
+    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
 
 
 def _get_snapshot_path(base_path: str) -> str:
@@ -172,10 +174,15 @@ def load_dataset_token_ids(
                 data = json.loads(line.strip())
                 text: str = data["text"]
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
-                    tokens = tokenizer.apply_chat_template(
+                    # Render to a string first, then encode -> guaranteed flat list[int].
+                    # (transformers 5.x apply_chat_template(tokenize=True) may return a
+                    # BatchEncoding instead of a token-id list.)
+                    templated = tokenizer.apply_chat_template(
                         [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
                         add_generation_prompt=True,
+                        tokenize=False,
                     )
+                    tokens = tokenizer.encode(templated, add_special_tokens=False)
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)
 

@@ -1,23 +1,17 @@
+import os
 import torch
 from torch import nn
 import flashinfer
 
 from ssd.utils.async_helpers.async_spec_helpers import apply_sampler_x_rescaling
 
-# Monkey-patch flashinfer 0.5.2 bug: get_seed_and_offset builds state on CPU
-# but generator is on CUDA, causing TypeError: RNG state must be a torch.ByteTensor.
+# NOTE: the original 0.5.2 monkey-patch is disabled here. On flashinfer 0.6.12
+# get_seed_and_offset has a different (3-arg) signature and works correctly, so
+# we delegate straight through instead of replacing it.
 import flashinfer.sampling as _fi_samp
 _orig_get_seed_and_offset = _fi_samp.get_seed_and_offset
-def _fixed_get_seed_and_offset(increment, generator=None):
-    if generator is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        generator = torch.Generator(device=device)
-    state = generator.get_state()
-    seed, offset = state.view(torch.int64)
-    offset += (increment + 3) // 4 * 4
-    new_state = torch.tensor([seed, offset], dtype=torch.int64, device=state.device).view(torch.uint8)
-    generator.set_state(new_state)
-    return int(seed), int(offset)
+def _fixed_get_seed_and_offset(*args, **kwargs):
+    return _orig_get_seed_and_offset(*args, **kwargs)
 _fi_samp.get_seed_and_offset = _fixed_get_seed_and_offset
 
 torch.manual_seed(0) 
@@ -37,6 +31,12 @@ class Sampler(nn.Module):
 
     @torch.inference_mode()
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, is_tree: bool = False):
+        # Greedy repro path: bypass flashinfer sampling (whose 0.6.x
+        # get_seed_and_offset signature is incompatible with the monkey-patch
+        # below) and use torch argmax directly.
+        if os.environ.get("SSD_FORCE_TORCH_GREEDY") == "1":
+            return logits.float().argmax(dim=-1)
+
         if self.sampler_x is not None and is_tree:
             logits_cpy = logits.to(torch.float)
             greedy_tokens = logits_cpy.argmax(dim=-1)

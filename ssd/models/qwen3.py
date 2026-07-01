@@ -216,8 +216,10 @@ class Qwen3Model(nn.Module):
         draft: bool = False,
         speculate: bool = False,
         spec_k: int = 1,
-        async_fan_out: int = 1, 
+        async_fan_out: int = 1,
         draft_async: bool = False,
+        use_eagle: bool = False,
+        eagle_layers: list[int] | None = None,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
     ) -> None:
@@ -227,6 +229,8 @@ class Qwen3Model(nn.Module):
         self.spec_k = spec_k
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
+        self.use_eagle = use_eagle
+        self.eagle_layers = eagle_layers
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -253,12 +257,21 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream 
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream
         residual = None
-        for layer in self.layers:
+        # Collect aux activations if use_eagle. EAGLE-3 (and vLLM) condition the draft
+        # on the *outputs* of the aux layers (2,32,61) -> collect AFTER each layer runs.
+        # The materialized residual-stream value after layer i is hidden_states + residual.
+        collected_acts = [] if self.use_eagle else None
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if collected_acts is not None and layer_idx in self.eagle_layers:
+                collected_acts.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if collected_acts:
+            eagle_acts = torch.cat(collected_acts, dim=-1)
+            return hidden_states, eagle_acts
         return hidden_states
 
 
@@ -273,12 +286,13 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config, 
+        config: Qwen3Config,
         draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
+        eagle_layers: list[int] | None = None,
         spec_k: int = 1,
-        async_fan_out: int = 1, 
+        async_fan_out: int = 1,
         draft_async: bool = False,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
@@ -290,12 +304,14 @@ class Qwen3ForCausalLM(nn.Module):
         self.draft_async = draft_async
         self.tp_group = tp_group
         self.tp_size = tp_size
-        
-        assert not use_eagle, "ERROR in Qwen3ForCausalLM: use_eagle not supported for Qwen3"
+        self.use_eagle = use_eagle
+
+        # use_eagle on the TARGET means it extracts aux hidden states for the eagle draft.
+        assert not (use_eagle and draft), "ERROR in Qwen3ForCausalLM: use_eagle belongs on the target, not the draft"
         assert not (tp_group is None and self.tp_size > 1), "ERROR in Qwen3ForCausalLM: tp_group is None and tp_size > 1"
 
-        print(f'Starting Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
-        self.model = Qwen3Model(config, draft, speculate, spec_k, async_fan_out, draft_async, tp_group=tp_group, tp_size=self.tp_size)
+        print(f'Starting Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}, use_eagle={use_eagle}')
+        self.model = Qwen3Model(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, eagle_layers=eagle_layers, tp_group=tp_group, tp_size=self.tp_size)
         self.async_fan_out = async_fan_out
         self.lm_head = ParallelLMHead(
             config.vocab_size,

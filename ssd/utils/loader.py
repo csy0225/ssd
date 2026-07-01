@@ -89,7 +89,18 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
         if not os.path.exists(bin_file):
             raise FileNotFoundError(f"No safetensors or pytorch_model.bin found at {path} for EAGLE3 draft model")
         state_dict = torch.load(bin_file, map_location="cpu")
-    
+
+    # Normalize speculators-format keys (e.g. RedHatAI Qwen3-32B eagle3) to the
+    # 'midlayer.' convention this loader already understands. The speculators
+    # checkpoint stores the single eagle layer under 'layers.0.*'; the rest of
+    # the keys (fc, norm, embed_tokens, lm_head, d2t, t2d) already match.
+    if any(k.startswith('layers.0.') for k in state_dict):
+        state_dict = {
+            ('midlayer.' + k[len('layers.0.'):] if k.startswith('layers.0.') else k): v
+            for k, v in state_dict.items()
+        }
+        print("[load_model] normalized speculators 'layers.0.*' keys -> 'midlayer.*'")
+
     # Load d2t and t2d dictionaries
     if hasattr(model, 'd2t') and 'd2t' in state_dict:
         d2t_tensor = state_dict['d2t']

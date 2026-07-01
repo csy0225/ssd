@@ -52,13 +52,13 @@ class Config:
         model = self.model 
         assert os.path.isdir(model)
 
-        assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
-        self.hf_config = AutoConfig.from_pretrained(model)
+        assert 1 <= self.num_gpus <= 8 # this codebase only works on one node
+        self.hf_config = self._load_hf_config(model)
         self.max_model_len = min(
-            self.max_model_len, self.hf_config.max_position_embeddings) 
-        if self.speculate: 
+            self.max_model_len, self.hf_config.max_position_embeddings)
+        if self.speculate:
             draft = self.draft
-            self.draft_hf_config = AutoConfig.from_pretrained(draft)
+            self.draft_hf_config = self._load_hf_config(draft)
             self.max_model_len = min(
                 self.max_model_len, self.draft_hf_config.max_position_embeddings)
             if self.draft_async:
@@ -92,3 +92,46 @@ class Config:
                     self.draft_hf_config.max_position_embeddings = target_max_pos
         
         assert self.max_num_batched_tokens >= self.max_model_len
+
+    def _load_hf_config(self, path: str):
+        """Load an HF config, flattening the 'speculators' EAGLE-3 format.
+
+        The speculators checkpoint (e.g. RedHatAI Qwen3-32B eagle3) nests the
+        transformer fields under 'transformer_layer_config' and has no top-level
+        'model_type', so AutoConfig.from_pretrained fails. Detect that format
+        (by the presence of 'transformer_layer_config') and build a flat
+        LlamaConfig; otherwise fall back to AutoConfig.
+        """
+        cfg_path = os.path.join(path, "config.json")
+        if os.path.exists(cfg_path):
+            import json
+            with open(cfg_path) as f:
+                ecfg = json.load(f)
+            tlc = ecfg.get("transformer_layer_config")
+            if tlc is not None:
+                from transformers import LlamaConfig
+                dc = LlamaConfig(
+                    hidden_size=tlc["hidden_size"],
+                    intermediate_size=tlc["intermediate_size"],
+                    num_hidden_layers=tlc.get("num_hidden_layers", 1),
+                    num_attention_heads=tlc["num_attention_heads"],
+                    num_key_value_heads=tlc.get("num_key_value_heads", tlc["num_attention_heads"]),
+                    head_dim=tlc.get("head_dim"),
+                    rms_norm_eps=tlc.get("rms_norm_eps", 1e-6),
+                    max_position_embeddings=tlc.get("max_position_embeddings", 4096),
+                    rope_theta=tlc.get("rope_theta", 10000.0),
+                    vocab_size=tlc["vocab_size"],
+                    hidden_act=tlc.get("hidden_act", "silu"),
+                    tie_word_embeddings=False,
+                )
+                dc.draft_vocab_size = ecfg.get("draft_vocab_size", dc.vocab_size)
+                # torch_dtype must be a real torch.dtype (engine calls set_default_dtype
+                # / .itemsize on it); LlamaConfig leaves it None by default.
+                _dt = ecfg.get("torch_dtype") or tlc.get("torch_dtype") or "bfloat16"
+                dc.torch_dtype = getattr(torch, _dt) if isinstance(_dt, str) else _dt
+                print(f"[Config] loaded speculators eagle3 draft config: hidden={dc.hidden_size}, "
+                      f"layers={dc.num_hidden_layers}, heads={dc.num_attention_heads}, "
+                      f"kv={dc.num_key_value_heads}, head_dim={dc.head_dim}, "
+                      f"draft_vocab={dc.draft_vocab_size}, dtype={dc.torch_dtype}", flush=True)
+                return dc
+        return AutoConfig.from_pretrained(path)

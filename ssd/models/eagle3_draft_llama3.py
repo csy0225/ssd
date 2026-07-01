@@ -146,12 +146,14 @@ class Eagle3DecoderLayer(nn.Module):
         normed_tokens = self.input_layernorm(token_embeddings)
         normed_conditioning = self.conditioning_feature_ln(conditioning_features)
         hidden_states = torch.cat([normed_tokens, normed_conditioning], dim=-1)
-        
-        hidden_states = self.self_attn(positions, hidden_states) 
-        # use conditioning features as residual stream, not token embeddings, as per SAFEAILab ref impl
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, conditioning_features) 
+
+        hidden_states = self.self_attn(positions, hidden_states)
+        # Use the NORMED conditioning as the residual stream (norm_before_residual=True,
+        # as in the speculators/RedHatAI eagle3 head's reference forward). Heads trained
+        # with norm_before_residual=False would instead use raw conditioning_features here.
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, normed_conditioning)
         hidden_states = self.mlp(hidden_states) + residual
-        return hidden_states 
+        return hidden_states
 
 class Eagle3DraftModel(nn.Module):
 

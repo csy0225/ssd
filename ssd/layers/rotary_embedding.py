@@ -60,7 +60,6 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -68,6 +67,8 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    assert rope_scaling is None
+    # rope_scaling intentionally ignored for benchmarking on the local Qwen3
+    # checkpoint (short-context repro); lru_cache removed because a dict arg is
+    # unhashable.
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb

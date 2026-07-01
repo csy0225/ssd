@@ -82,7 +82,7 @@ def parse_arguments():
         args.llama = False
     if args.eagle:
         args.spec = True
-        assert args.llama, "Eagle currently only supports llama models"
+        # Eagle now supports llama and qwen3 targets (qwen3 aux-hidden extraction added).
         assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
     return args

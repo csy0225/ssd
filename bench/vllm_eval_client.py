@@ -4,7 +4,8 @@ import argparse
 import requests
 from random import seed
 from transformers import AutoTokenizer
-from bench_helpers import get_model_paths, generate_benchmark_inputs
+from bench_helpers import generate_benchmark_inputs
+from bench_paths import MODELS, resolve_snapshot
 
 def main():
     parser = argparse.ArgumentParser()
@@ -42,7 +43,10 @@ def main():
     assert r.status_code == 200, f"Server not reachable at {url}"
     print(f"Server OK at {url}")
 
-    _, model_path, _ = get_model_paths(args)
+    if args.llama:
+        model_path = resolve_snapshot(MODELS["llama_70b"])
+    else:
+        model_path = resolve_snapshot(MODELS["qwen_32b"])
     string_prompts, prompt_token_ids, _ = generate_benchmark_inputs(args, model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 

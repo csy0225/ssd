@@ -20,7 +20,6 @@ dependencies = [
     "safetensors==0.6.2",
     "tqdm==4.67.1",
     "flashinfer-python==0.5.2",
-    "sgl-kernel==0.3.17.post1",
     "nvidia-cutlass-dsl==4.2.1",
     "wandb==0.22.0",
     "hf_transfer",
